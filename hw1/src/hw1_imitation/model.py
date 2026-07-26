@@ -88,13 +88,37 @@ class FlowMatchingPolicy(BasePolicy):
         hidden_dims: tuple[int, ...] = (128, 128),
     ) -> None:
         super().__init__(state_dim, action_dim, chunk_size)
+        chunk_dim = chunk_size * action_dim
+        layer_dims = (state_dim + chunk_dim + 1, *hidden_dims, chunk_dim)
+        layers: list[nn.Module] = []
+        for index, (input_dim, output_dim) in enumerate(
+            zip(layer_dims[:-1], layer_dims[1:])
+        ):
+            layers.append(nn.Linear(input_dim, output_dim))
+            if index < len(layer_dims) - 2:
+                layers.append(nn.ReLU())
+        self.layers = nn.Sequential(*layers)
 
     def compute_loss(
         self,
         state: torch.Tensor,
         action_chunk: torch.Tensor,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        batch_size = state.size(0)
+        actions_tau1 = action_chunk.reshape(batch_size, -1)
+        actions_tau0 = torch.randn_like(actions_tau1)
+        tau = torch.rand(
+            batch_size,
+            1,
+            device=state.device,
+            dtype=state.dtype,
+        )
+
+        actions_tau = tau * actions_tau1 + (1.0 - tau) * actions_tau0
+        inputs = torch.cat([state, actions_tau, tau], dim=1)
+        predicted_velocities = self.layers(inputs)
+        target_velocities = actions_tau1 - actions_tau0
+        return nn.functional.mse_loss(predicted_velocities, target_velocities)
 
     def sample_actions(
         self,
@@ -102,8 +126,26 @@ class FlowMatchingPolicy(BasePolicy):
         *,
         num_steps: int = 10,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive")
 
+        batch_size = state.size(0)
+        chunk_dim = self.chunk_size * self.action_dim
+        with torch.no_grad():
+            actions_tau = torch.randn(
+                batch_size,
+                chunk_dim,
+                device=state.device,
+                dtype=state.dtype,
+            )
+            step_size = 1.0 / num_steps
+            for step in range(num_steps):
+                tau = actions_tau.new_full((batch_size, 1), step * step_size)
+                inputs = torch.cat([state, actions_tau, tau], dim=1)
+                velocity = self.layers(inputs)
+                actions_tau = actions_tau + step_size * velocity
+
+        return actions_tau.reshape(batch_size, self.chunk_size, self.action_dim)
 
 PolicyType: TypeAlias = Literal["mse", "flow"]
 
